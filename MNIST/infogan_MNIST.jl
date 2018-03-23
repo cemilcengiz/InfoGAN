@@ -1,7 +1,8 @@
 for p in ("Knet","ArgParse","Images", "Distributions")
     Pkg.installed(p) == nothing && Pkg.add(p)
 end
-include(Pkg.dir("Knet","data","mnist.jl", "imagenet.jl"))
+include(Pkg.dir("Knet","data","mnist.jl"))#, "imagenet.jl"))
+include(Pkg.dir("Knet","data","imagenet.jl"))
 
 module InfoGAN_MNIST
 using Knet
@@ -25,9 +26,17 @@ function main(args)
                  :wq => map(wi->eval(parse(o[:optim])), wq)
                  )
 
-    # For output grid
-    l0 = map(i->reshape(collect(1:10), 1, 10), 1:10)
+    ##
+    ny = 10
+    # Discrete codes for example generations
+    l0 = map(i->reshape(collect(1:ny), 1, ny), 1:o[:gridrows])
     l1 = vec(vcat(l0...)) #00...011...122...23...99...9
+
+    # Fix some noise and code to check the GAN output
+    z = sample_gauss(o[:atype],o[:zdim],10*o[:gridrows])
+    c = sample_categoric(o[:atype],o[:cdim],10*o[:gridrows])
+    g = sample_unif(o[:atype],o[:gdim],10*o[:gridrows])
+
     
     if o[:outdir] != nothing && !isdir(o[:outdir])
         mkpath(o[:outdir])
@@ -58,9 +67,10 @@ function main(args)
         if o[:outdir] != nothing
             filename = @sprintf("%04d.png",epoch)
             filepath = joinpath(o[:outdir],"generations",filename)
-            plot_generations(
-                             wgq[:wg], mg, l1; z=z, savefile=filepath,
-                             scale=o[:gridscale], gridsize=o[:gridsize])
+            generate_and_plot(
+                              wgq[:wg], mg; c=l1, savefile=filepath, z=z,
+                              scale=o[:gridscale], gridsize=(ny, o[:gridrows]))
+            
             filename = @sprintf("%04d.jld2",epoch)
             filepath = joinpath(o[:outdir],"models",filename)
             save_weights(filepath,wd,wgq,md,mg,mq)
@@ -78,13 +88,13 @@ function parse_options(args)
     @add_arg_table s begin
         ("--atype"; default=(gpu()>=0?"KnetArray{Float32}":"Array{Float32}");
          help="array and float type to use")
-        ("--batchsize"; arg_type=Int; default=64; help="batch size")
+        ("--batchsize"; arg_type=Int; default=128; help="batch size")
         ("--zdim"; arg_type=Int; default=62; help="noise dimension")
         ("--cdim"; arg_type=Int; default=10; help=("Discrete code length. Default is 10 for Mnist digits."))
         ("--gdim"; arg_type=Int; default=2; help=("Continuos code length. It models the mean and standard deviations of Gaussians."))
-        ("--epochs"; arg_type=Int; default=20; help="# of training epochs")
+        ("--epochs"; arg_type=Int; default=50; help="# of training epochs")
         ("--seed"; arg_type=Int; default=1; help="random seed")
-        ("--gridsize"; arg_type=Int; nargs=2; default=[10,10])
+        ("--gridrows"; arg_type=Int; default=10)
         ("--gridscale"; arg_type=Float64; default=2.0)
         ("--optim"; default="Adam(;lr=0.0002, beta1=0.5)")
         ("--loadfile"; default=nothing; help="file to load trained models")
@@ -160,7 +170,7 @@ function sample_gauss(atype,zdim,nsamples;mu=0,sigma=1)
 end
 
 function sample_unif(atype,gdim,nsamples;l=-1,u=1)
-    dist = Unif(l,u)
+    dist = Uniform(l,u)
     g = rand(dist, gdim, nsamples)
     convert(atype, g)
 end
@@ -176,7 +186,7 @@ function initwd(atype, winit=0.01)
     m = Any[]
 
     push!(w, winit*randn(4,4,1,64))
-  
+    
     push!(w, winit*randn(4,4,64,128))
     push!(w, bnparams(128))
     push!(m, bnmoments())
@@ -193,7 +203,7 @@ end
 function dnet(w,x,m; training=true, alpha=0.1)
     x1 = dlayer1(x, w[1])
     x2 = dlayer2(x1, w[2:3], m[1]; training=true)
-    x2 = mat(x2) 
+    x2 = mat(x2)
     x3 = dlayer3(x2, w[4:5], m[2]; training=true)
     x4 = w[end-1]*x3 .+ w[end]
     x5 = sigm.(x4) #??? 
@@ -264,8 +274,10 @@ function gnet(wg,mg,z,c,g; training=true)  #add c,g
     x1 = glayer1(x0, wg[1:2], mg[1]; training=training)
     x2 = glayer1(x1, wg[3:4], mg[2]; training=training)
     x3 = reshape(x2, 7,7,128,size(x2,2))
-    x4 = glayer2(x3, wg[5:6], mg[3]; training=training)
-    x5 = tanh.(deconv4(wg[end-1], x4) .+ wg[end])
+    x4 = glayer2(x3, wg[5:6], mg[3]; padding=1, training=training)
+    #x5 = tanh.(deconv4(wg[end-1], x4) .+ wg[end])
+    x5 = tanh.(deconv4(wg[end-1], x4; stride=2, padding=1) .+ wg[end])
+    return x5
 end
 
 
@@ -275,8 +287,8 @@ function glayer1(x0, w, m; training=true)
     x = relu.(x)
 end
 
-function glayer2(x0, w, m; training=true)
-    x = deconv4(w[1], x0; stride=2)
+function glayer2(x0, w, m; padding=1,stride=2, training=true)
+    x = deconv4(w[1], x0; padding=padding, stride=stride)
     x = batchnorm(x, m, w[2]; training=training)
     x = relu.(x)
 end
@@ -295,12 +307,12 @@ function train_generator!(wgq,wd,mg,md,z,c,g,optgq,o)
     return lossval
 end
 
-function initwq(atype, cdim=10, gdim=2 ,winit=0.01)
+function initwq(atype, cdim=10, gdim=2, winit=0.01)
     w = Any[]
     m = Any[]
 
     push!(w, winit*randn(4,4,1,64))
-  
+    
     push!(w, winit*randn(4,4,64,128))
     push!(w, bnparams(128))
     push!(m, bnmoments())
@@ -331,21 +343,40 @@ function qnet(wq,mq,x; training=true, alpha=0.1)
     #FC.output
     x5 = wq[end-1]*x4 .+ wq[end] #shape: (cdim+gdim,batchsize)
 
-    # Compute softmax for discrete code
+    # Apply softmax for discrete code
     xc = x5[1:cdim,:];  xg = x5[1+cdim:end,:];
     xc = exp.(logp(xc,1))  #shape: (cdim,batchsize)
 
-    # Make sure the continuous code learning the standard deviation is positive by computing its exponential
-    xg[2,:] = exp.(xg[1,:]) #shape: (1,batchsize)
-    #Dont touch the mean i.e. xg[1,:]
-    return vcat(xc,xg)
+    # Apply sigmoid individually for continuous codes
+    xg = sigm.(xg) #shape: (2,batchsize)
+    #return vcat(xc,xg)
+    return (xc,xg)
 end
 
-function qloss(wgq,mg,mq,z,c,g)
+function qloss(wgq, mg, mq, z, c, g; fix_std=true)
     fake_images = gnet(wgq[:wg],mg,z,c,g; training=true)
-    q_c_given_x = qnet(wgq[:wq],mq,fake_images) #shape (cdim+gdim,batchsize)
-    cond_ent = -mean(sum(log.(q_c_given_x +1e-8) .* c, 1))
-    return cond_ent
+    #q_c_given_x = qnet(wgq[:wq],mq,fake_images) #shape (cdim+gdim,batchsize)
+    q_c_given_x_disc, q_c_given_x_cont = qnet(wgq[:wq],mq,fake_images)  #shape (cdim,batchsize and gdim,batchsize)
+    
+    disc_cross_ent = -mean(sum(log.(q_c_given_x_disc +1e-8) .* c, 1))
+    disc_ent = -mean(sum(log.(c+1e-8) .* c, 1))
+    disc_loss = disc_ent - disc_cross_ent
+
+    "
+#For continuous code (generally mean and standard dev. of a Gaussian r.v.)
+#mu = q_c_given_x_cont[1,:]   # first row is for mean
+if fix_std   # we use fixed standard deviation i.e. 1.
+    q_c_given_x_cont[2,:] .= 1
+    #std_dev = convert(typeof(mu), ones(size(mu)))  # shape: (1,batchsize)
+else  #predict standard dev using qnet
+    q_c_given_x_cont[2,:] = sqrt.(exp.(q_c_given_x_cont[2,:]))  # second rov is for std dev
+end
+"   
+    cont_cross_ent = -mean(sum(log.(q_c_given_x_cont +1e-8) .* g, 1))
+    cont_ent = -mean(sum(log.(g+1e-8) .* g, 1))
+    cont_loss = cont_ent - cont_cross_ent
+
+    return disc_loss + cont_loss
 end
 
 qlossgradient = gradloss(qloss)
@@ -357,28 +388,38 @@ function train_qnet!(wgq,mg,mq,z,c,g,optgq,o)
     return lossval
 end
 
-function plot_generations(
-    wg, mg; z=nothing, c=nothing, g=nothing, gridsize=(10,10), scale=1.0, savefile=nothing)
-    if z == nothing
-        nimg = prod(gridsize)
+function generate_images(wg, mg, z=nothing, c=nothing, g=nothing)
+    nimg = size(wg[1],2)
+    atype = wg[1] isa KnetArray ? KnetArray{Float32} : Array{Float32}
+    if z == nothing || c == nothing || g==nothing
+        #nimg = prod(gridsize)
         zdim = 62
         cdim = 10
         gdim = 2
-        atype = wg[1] isa KnetArray ? KnetArray{Float32} : Array{Float32}
         z = sample_gauss(atype,zdim,nimg)
         c = sample_categoric(atype,cdim,nimg)
-        # g is std,mean of a Gaussian
-        #g = sample_gauss(atype,gdim,nimg)
+        g = sample_unif(atype,gdim,nimg)
+
     end
-    
     output = Array(0.5*(1+gnet(wg,mg,z,c,g; training=false)))
     images = map(i->output[:,:,:,i], 1:size(output,4))
+end
+
+function plot_images(images, gridsize=(8,8), scale=1.0, savefile=nothing)
     grid = Main.make_image_grid(images; gridsize=gridsize, scale=scale)
     if savefile == nothing
+        #display(colorview(RGB, grid))
         display(colorview(Gray, grid))
     else
-        save(savefile, grid)
+        # save(savefile, colorview(RGB, grid))
+        save(savefile, colorview(Gray, grid))
     end
+end
+
+
+function generate_and_plot(wg, mg; z=nothing, c=nothing, g=nothing, savefile=nothing, gridsize=(8,8), scale=1.)
+    images = generate_images(wg, mg, z, c, g)
+    plot_images(images, gridsize, scale, savefile)
 end
 
 splitdir(PROGRAM_FILE)[end] == "infogan_MNIST.jl" && main(ARGS)
