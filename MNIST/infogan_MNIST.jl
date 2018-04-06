@@ -25,17 +25,19 @@ function main(args)
                  :wg => map(wi->Adam(;lr=0.003, beta1=0.5), wg),
                  :wq => map(wi->eval(parse(o[:optim])), wq)
                  )
-
+    
+    disc_embed_mat = init_disc_embed(o[:atype], o[:cdim])
     ##
     ny = 10
     # Discrete codes for example generations
-    l0 = map(i->reshape(collect(1:ny), 1, ny), 1:o[:gridrows])
-    l1 = vec(vcat(l0...)) #00...011...122...23...99...9
-
+    l0 = map(i->reshape(collect(1:ny), 1, ny), 1:o[:gridrows])  #gridrows is 10 by default
+    l1 = vec(vcat(l0...)) #[11...122...23...99...9910...10]' column vector with lenght ny*o[:gridsize]
+    
     # Fix some noise and code to check the GAN output
-    z = sample_gauss(o[:atype],o[:zdim],10*o[:gridrows])
-    c = sample_categoric(o[:atype],o[:cdim],10*o[:gridrows])
-    g = sample_unif(o[:atype],o[:gdim],10*o[:gridrows])
+    z_fix = sample_gauss(o[:atype],o[:zdim],10*o[:gridrows])
+    c_fix = convert(o[:atype], disc_embed_mat[:,l1])
+    #c = sample_categoric(o[:atype],o[:cdim],10*o[:gridrows])
+    g_fix = sample_unif(o[:atype],o[:gdim],10*o[:gridrows])
 
     
     if o[:outdir] != nothing && !isdir(o[:outdir])
@@ -64,11 +66,11 @@ function main(args)
         flush(STDOUT)
 
         # save models and generations
-        if o[:outdir] != nothing
+        if o[:outdir] != nothing && epoch % 5==0
             filename = @sprintf("%04d.png",epoch)
             filepath = joinpath(o[:outdir],"generations",filename)
             generate_and_plot(
-                              wgq[:wg], mg; c=l1, savefile=filepath, z=z,
+                              wgq[:wg], mg; savefile=filepath, z=z_fix, c=c_fix, g=g_fix,
                               scale=o[:gridscale], gridsize=(ny, o[:gridrows]))
             
             filename = @sprintf("%04d.jld2",epoch)
@@ -180,6 +182,12 @@ function sample_categoric(atype,cdim,nsamples,mu=0.5,sigma=0.5)
     c = rand(dist,nsamples)   #one-hot vectors.shape [cdim,nsamples]
     convert(atype, c)
 end
+
+
+function init_disc_embed(atype, code_len)
+    cb = atype(eye(code_len))
+end  
+
 
 function initwd(atype, winit=0.01)
     w = Any[]
@@ -360,7 +368,8 @@ function qloss(wgq, mg, mq, z, c, g; fix_std=true)
     
     disc_cross_ent = -mean(sum(log.(q_c_given_x_disc +1e-8) .* c, 1))
     disc_ent = -mean(sum(log.(c+1e-8) .* c, 1))
-    disc_loss = disc_ent - disc_cross_ent
+   # disc_loss = disc_ent - disc_cross_ent
+    disc_loss = -disc_ent + disc_cross_ent  # negative of mutual info.
 
     "
 #For continuous code (generally mean and standard dev. of a Gaussian r.v.)
@@ -371,12 +380,26 @@ if fix_std   # we use fixed standard deviation i.e. 1.
 else  #predict standard dev using qnet
     q_c_given_x_cont[2,:] = sqrt.(exp.(q_c_given_x_cont[2,:]))  # second rov is for std dev
 end
-"   
+"
+"""    
     cont_cross_ent = -mean(sum(log.(q_c_given_x_cont +1e-8) .* g, 1))
     cont_ent = -mean(sum(log.(g+1e-8) .* g, 1))
-    cont_loss = cont_ent - cont_cross_ent
+   # cont_loss = cont_ent - cont_cross_ent
+    cont_loss = -cont_ent + cont_cross_ent  # negative of mutual info
 
-    return disc_loss + cont_loss
+"""
+"""    
+    println("q_c_given_x_cont= ", size(q_c_given_x_cont))
+    println("size g= ", size(g))
+    """
+    
+   """
+    println("q_c_given_x_cont= ", Array{Float32}(getval(q_c_given_x_cont)))
+    println("g= ", Array{Float32}(getval(g)))
+    println("cont loss= ", getval(cont_loss))
+"""
+    
+    return disc_loss # + cont_loss
 end
 
 qlossgradient = gradloss(qloss)
@@ -391,15 +414,19 @@ end
 function generate_images(wg, mg, z=nothing, c=nothing, g=nothing)
     nimg = size(wg[1],2)
     atype = wg[1] isa KnetArray ? KnetArray{Float32} : Array{Float32}
-    if z == nothing || c == nothing || g==nothing
-        #nimg = prod(gridsize)
+    if z == nothing 
         zdim = 62
-        cdim = 10
-        gdim = 2
         z = sample_gauss(atype,zdim,nimg)
+    end
+    
+    if c == nothing
+        cdim = 10
         c = sample_categoric(atype,cdim,nimg)
+    end
+    
+    if g == nothing
+        gdim = 2
         g = sample_unif(atype,gdim,nimg)
-
     end
     output = Array(0.5*(1+gnet(wg,mg,z,c,g; training=false)))
     images = map(i->output[:,:,:,i], 1:size(output,4))
