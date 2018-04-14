@@ -37,8 +37,13 @@ function main(args)
     z_fix = sample_gauss(o[:atype],o[:zdim],10*o[:gridrows])
     c_fix = convert(o[:atype], disc_embed_mat[:,l1])
     #c = sample_categoric(o[:atype],o[:cdim],10*o[:gridrows])
-    g_fix = sample_unif(o[:atype],o[:gdim],10*o[:gridrows])
-
+    gl0 = map(i->Array{Float32}(reshape(-2:4/(ny-1):2, 1, ny)), 1:o[:gridrows])
+    gl = vec(hcat(gl0...))
+    gl = hcat(gl0...)
+    gl = convert(o[:atype],gl)
+    gl_rand = sample_unif(o[:atype],1,10*o[:gridrows])
+   # g_fix = vcat(gl, gl_rand)  # fix one cont r.v. constant. the other is random
+    g_fix = vcat(gl, gl)
     
     if o[:outdir] != nothing && !isdir(o[:outdir])
         mkpath(o[:outdir])
@@ -66,7 +71,7 @@ function main(args)
         flush(STDOUT)
 
         # save models and generations
-        if o[:outdir] != nothing && epoch % 5==0
+        if o[:outdir] != nothing #&& epoch % 5==0
             filename = @sprintf("%04d.png",epoch)
             filepath = joinpath(o[:outdir],"generations",filename)
             generate_and_plot(
@@ -94,7 +99,7 @@ function parse_options(args)
         ("--zdim"; arg_type=Int; default=62; help="noise dimension")
         ("--cdim"; arg_type=Int; default=10; help=("Discrete code length. Default is 10 for Mnist digits."))
         ("--gdim"; arg_type=Int; default=2; help=("Continuos code length. It models the mean and standard deviations of Gaussians."))
-        ("--epochs"; arg_type=Int; default=50; help="# of training epochs")
+        ("--epochs"; arg_type=Int; default=100; help="# of training epochs")
         ("--seed"; arg_type=Int; default=1; help="random seed")
         ("--gridrows"; arg_type=Int; default=10)
         ("--gridscale"; arg_type=Float64; default=2.0)
@@ -356,50 +361,31 @@ function qnet(wq,mq,x; training=true, alpha=0.1)
     xc = exp.(logp(xc,1))  #shape: (cdim,batchsize)
 
     # Apply sigmoid individually for continuous codes
-    xg = sigm.(xg) #shape: (2,batchsize)
-    #return vcat(xc,xg)
+    # xg = sigm.(xg) #shape: (2,batchsize)
     return (xc,xg)
 end
 
-function qloss(wgq, mg, mq, z, c, g; fix_std=true)
+function qloss(wgq, mg, mq, z, c, g; atype=KnetArray{Float32}, fix_std=true)
     fake_images = gnet(wgq[:wg],mg,z,c,g; training=true)
-    #q_c_given_x = qnet(wgq[:wq],mq,fake_images) #shape (cdim+gdim,batchsize)
     q_c_given_x_disc, q_c_given_x_cont = qnet(wgq[:wq],mq,fake_images)  #shape (cdim,batchsize and gdim,batchsize)
     
     disc_cross_ent = -mean(sum(log.(q_c_given_x_disc +1e-8) .* c, 1))
     disc_ent = -mean(sum(log.(c+1e-8) .* c, 1))
-   # disc_loss = disc_ent - disc_cross_ent
     disc_loss = -disc_ent + disc_cross_ent  # negative of mutual info.
+  #  println("disc loss= ", getval(disc_loss))
 
-    "
-#For continuous code (generally mean and standard dev. of a Gaussian r.v.)
-#mu = q_c_given_x_cont[1,:]   # first row is for mean
-if fix_std   # we use fixed standard deviation i.e. 1.
-    q_c_given_x_cont[2,:] .= 1
-    #std_dev = convert(typeof(mu), ones(size(mu)))  # shape: (1,batchsize)
-else  #predict standard dev using qnet
-    q_c_given_x_cont[2,:] = sqrt.(exp.(q_c_given_x_cont[2,:]))  # second rov is for std dev
-end
-"
-"""    
-    cont_cross_ent = -mean(sum(log.(q_c_given_x_cont +1e-8) .* g, 1))
-    cont_ent = -mean(sum(log.(g+1e-8) .* g, 1))
-   # cont_loss = cont_ent - cont_cross_ent
-    cont_loss = -cont_ent + cont_cross_ent  # negative of mutual info
+# For continuous code (generally mean and standard dev. of a Gaussian r.v.)
+    mu = q_c_given_x_cont[1,:]   # first row is for mean
+    if fix_std   # we use fixed standard deviation i.e. 1.
+        sg = convert(atype, ones(size(mu)))  # shape: (1,batchsize)
+    else  #predict standard dev using qnet
+        sg = exp.(q_c_given_x_cont[2,:])  # second rov is for variance
+    end
+    nsamples = 2
+    nll_gauss = 0.5*mean(abs2.(mu .- g[1,:]) ./ sg) + 0.5*mean(abs2.(mu .- g[2,:]) ./ sg) + 0.5*nsamples*mean(log.(sg + 1e-8))   
+  #  println("nll_gauss= ", getval(nll_gauss))
 
-"""
-"""    
-    println("q_c_given_x_cont= ", size(q_c_given_x_cont))
-    println("size g= ", size(g))
-    """
-    
-   """
-    println("q_c_given_x_cont= ", Array{Float32}(getval(q_c_given_x_cont)))
-    println("g= ", Array{Float32}(getval(g)))
-    println("cont loss= ", getval(cont_loss))
-"""
-    
-    return disc_loss # + cont_loss
+    return disc_loss + nll_gauss
 end
 
 qlossgradient = gradloss(qloss)
