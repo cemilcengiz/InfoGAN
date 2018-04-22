@@ -1,12 +1,13 @@
 for p in ("Knet","ArgParse","Images", "Distributions")
     Pkg.installed(p) == nothing && Pkg.add(p)
 end
-include(Pkg.dir("Knet","data","mnist.jl"))#, "imagenet.jl"))
+# include(Pkg.dir("Knet","data","mnist.jl"))#, "imagenet.jl"))
 include(Pkg.dir("Knet","data","imagenet.jl"))
 
-module InfoGAN_MNIST
+module InfoGAN_SVHN2
 using Knet
 using Distributions
+using MAT
 using Images
 using ArgParse
 using JLD2, FileIO
@@ -16,9 +17,9 @@ function main(args)
     o[:seed] > 0 && Knet.setseed(o[:seed])
 
     # load models, data, optimizers
-    wd, wg, wq, md, mg, mq = load_weights(o[:atype], o[:zdim], o[:cdim], o[:gdim], o[:loadfile])
+    wd, wg, wq, md, mg, mq = load_weights(o[:atype], o[:zdim], o[:cdim], o[:ndisc], o[:gdim], o[:loadfile])
     wgq = Dict(:wg => wg, :wq => wq)
-    xtrn,ytrn,xtst,ytst = Main.mnist() #60,000 instances
+    xtrn,ytrn = SVHN2.traindata() # 73,257 instances
     dtrn = minibatch(xtrn, ytrn, o[:batchsize]; shuffle=true, xtype=o[:atype])  #length trnsize/batchsize
     optd = map(wi->eval(parse(o[:optim])), wd)
     optgq = Dict(
@@ -31,19 +32,23 @@ function main(args)
     ny = 10 # length of categorical code
     # Discrete codes for example generations
     l0 = map(i->reshape(collect(1:ny), 1, ny), 1:o[:gridrows])  #gridrows is 5 by default
-    l1 = vec(vcat(l0...)) #[11...122...23...99...9910...10]' column vector with lenght ny*o[:gridsize]
+    l1 = vec(vcat(l0...)) #[11...122...23...99...9910...10] vector with lenght ny*o[:gridsize]
     
     # Fix some noise and code to check the GAN output
-    z_fix = sample_gauss(o[:atype],o[:zdim],10*o[:gridrows])
-    c_fix = convert(o[:atype], disc_embed_mat[:,l1])
+    z_fix = sample_gauss(o[:atype],o[:zdim],ny*o[:gridrows])
+
     #c = sample_categoric(o[:atype],o[:cdim],10*o[:gridrows])
-    gl0 = map(i->Array{Float32}(reshape(-2:4/(ny-1):2, 1, ny)), 1:o[:gridrows])
+    cl_rand = sample_categoric(o[:atype],o[:cdim],ny*o[:gridrows])
+    cl = convert(o[:atype], disc_embed_mat[:,l1])
+    c_fix = vcat(cl, cl_rand, cl_rand, cl_rand)  # control one disc r.v. the others are varying
+
+    low_g = -1; high_g =1;
+    gl0 = map(i->Array{Float32}(reshape(low_g:(high_g-low_g)/(ny-1):high_g, 1, ny)), 1:o[:gridrows])
     gl = vec(hcat(gl0...))
     gl = hcat(gl0...)
     gl = convert(o[:atype],gl)
-    gl_rand = sample_unif(o[:atype],1,10*o[:gridrows])
-   # g_fix = vcat(gl, gl_rand)  # fix one cont r.v. constant. the other is random
-    g_fix = vcat(gl, gl)
+    gl_rand = sample_unif(o[:atype],1,ny*o[:gridrows])
+    g_fix = vcat(gl, gl_rand ,gl_rand, gl_rand)  # control one disc r.v. the others are varying
     
     if o[:outdir] != nothing && !isdir(o[:outdir])
         mkpath(o[:outdir])
@@ -57,7 +62,7 @@ function main(args)
         dlossval = glossval = qlossval = 0
         @time for (x,y) in dtrn
             z = sample_gauss(o[:atype],o[:zdim],length(y))
-            c = sample_categoric(o[:atype],o[:cdim],length(y))
+            c = sample_categoric_multiple(o[:atype],o[:cdim],length(y);n=4)
             g = sample_unif(o[:atype],o[:gdim],length(y))
             #train D
             dlossval += train_discriminator!(wd,wgq,md,mg,2x-1,z,c,g,optd,o)
@@ -90,15 +95,16 @@ end
 function parse_options(args)
     s = ArgParseSettings()
     s.description =
-        "InfoGAN on MNIST."
+        "InfoGAN on SVHN2."
 
     @add_arg_table s begin
         ("--atype"; default=(gpu()>=0?"KnetArray{Float32}":"Array{Float32}");
          help="array and float type to use")
         ("--batchsize"; arg_type=Int; default=128; help="batch size")
-        ("--zdim"; arg_type=Int; default=62; help="noise dimension")
-        ("--cdim"; arg_type=Int; default=10; help=("Discrete code length. Default is 10 for Mnist digits."))
-        ("--gdim"; arg_type=Int; default=2; help=("Continuos code length."))
+        ("--zdim"; arg_type=Int; default=124; help="noise dimension")
+        ("--cdim"; arg_type=Int; default=10; help=("Discrete code length."))
+        ("--ndisc"; arg_type=Int; default=4; help=("number of discrete(categorical) codes"))
+        ("--gdim"; arg_type=Int; default=4; help=("Continuos code length."))
         ("--epochs"; arg_type=Int; default=100; help="# of training epochs")
         ("--seed"; arg_type=Int; default=1; help="random seed")
         ("--gridrows"; arg_type=Int; default=5)
@@ -117,11 +123,11 @@ function parse_options(args)
     return o
 end
 
-function load_weights(atype,zdim,cdim,gdim,loadfile=nothing)
+function load_weights(atype,zdim,cdim,ndisc,gdim,loadfile=nothing)
     if loadfile == nothing
         wd, md = initwd(atype)
-        wg, mg = initwg(atype,zdim,cdim,gdim)
-        wq, mq = initwq(atype,cdim,gdim)
+        wg, mg = initwg(atype,zdim,cdim,ndisc,gdim)
+        wq, mq = initwq(atype,cdim,ndisc,gdim)
     else
         @load loadfile wd wg wq md mg mq
         wd = convert_weights(wd, atype)
@@ -188,6 +194,11 @@ function sample_categoric(atype,cdim,nsamples,mu=0.5,sigma=0.5)
     convert(atype, c)
 end
 
+function sample_categoric_multiple(atype,cdim,nsamples,mu=0.5,sigma=0.5;n=4)
+    c = []
+    map(x->push!(c,sample_categoric(atype,cdim,nsamples,mu,sigma)), 1:n)
+    vcat(c...)
+end
 
 function init_disc_embed(atype, code_len)
     cb = atype(eye(code_len))
@@ -198,14 +209,14 @@ function initwd(atype, winit=0.01)
     w = Any[]
     m = Any[]
 
-    push!(w, winit*randn(4,4,1,64))
+    push!(w, winit*randn(4,4,3,64))
     
     push!(w, winit*randn(4,4,64,128))
     push!(w, bnparams(128))
     push!(m, bnmoments())
-    
-    push!(w, winit*randn(1024,3200))
-    push!(w, bnparams(1024))
+
+    push!(w, winit*randn(4,4,128,256))
+    push!(w, bnparams(256))
     push!(m, bnmoments())
 
     push!(w, winit*randn(1,1024))
@@ -216,10 +227,10 @@ end
 function dnet(w,x,m; training=true, alpha=0.1)
     x1 = dlayer1(x, w[1])
     x2 = dlayer2(x1, w[2:3], m[1]; training=true)
-    x2 = mat(x2)
-    x3 = dlayer3(x2, w[4:5], m[2]; training=true)
+    x3 = dlayer2(x2, w[4:5], m[2]; training=true)
+    x3 = mat(x3) # (1024,Batchize)
     x4 = w[end-1]*x3 .+ w[end]
-    x5 = sigm.(x4) #??? 
+    x5 = sigm.(x4)
 end
 
 function dlayer1(x0, w; stride=2, padding=0, alpha=0.1)
@@ -257,40 +268,41 @@ function train_discriminator!(wd,wgq,md,mg,real_images,z,c,g,optd,o)
     return lossval
 end
 
-function initwg(atype=Array{Float32}, zdim=62, cdim=10, gdim=2, winit=0.01)
-    #input: z+c+g=62+10+2=74 dim
+function initwg(atype=Array{Float32}, zdim=124, cdim=10, ndisc=4, gdim=4, winit=0.01)
+    #input: z+c*ndisc+g=124+10*4+4=168 dim
     w = Any[]
     m = Any[]
+    #fc-relu-bn
+    push!(w, winit*randn(2*2*448, zdim+cdim*ndisc+gdim))
+    push!(w, bnparams(2*2*448))
+    push!(m, bnmoments())
+    
+    #upconv-relu-bn
+    push!(w, winit*randn(4,4,256,448))
+    push!(w, bnparams(256))
+    push!(m, bnmoments())
 
-    # 2 dense layers combined with batch normalization layers
-    push!(w, winit*randn(1024,zdim+cdim+gdim))
-    push!(w, bnparams(1024))
-    push!(m, bnmoments())
-    
-    push!(w, winit*randn(7*7*128, 1024))
-    push!(w, bnparams(7*7*128))
-    push!(m, bnmoments())
-    
-    # 1 deconv layer combined with batch normalization layer
+    #upconv-relu
+    push!(w, winit*randn(4,4,128,256))
+
+    #upconv-relu
     push!(w, winit*randn(4,4,64,128))
-    push!(w, bnparams(64))
-    push!(m, bnmoments())
 
-    # final deconvolution layer
-    push!(w, winit*randn(4,4,1,64))
-    push!(w, winit*randn(1,1,1,1))
+    #upconv-tanh
+    push!(w, winit*randn(4,4,3,64))
+    push!(w, winit*randn(1,1,3,1))
     return convert_weights(w,atype), m
 end
 
 function gnet(wg,mg,z,c,g; training=true)  #add c,g
     x0 = vcat(z,c,g)
-    x1 = glayer1(x0, wg[1:2], mg[1]; training=training)
-    x2 = glayer1(x1, wg[3:4], mg[2]; training=training)
-    x3 = reshape(x2, 7,7,128,size(x2,2))
-    x4 = glayer2(x3, wg[5:6], mg[3]; padding=1, training=training)
-    #x5 = tanh.(deconv4(wg[end-1], x4) .+ wg[end])
-    x5 = tanh.(deconv4(wg[end-1], x4; stride=2, padding=1) .+ wg[end])
-    return x5
+    x1 = glayer1(x0, wg[1:2], mg[1]; training=training) #(1792,bs)
+    x2 = reshape(x1, 2,2,448,size(x1,2)) #(2,2,448,bs)
+    x3 = glayer2(x2, wg[3:4], mg[2]; padding=1, training=training) #(4,4,256,bs)
+    x4 = glayer3(x3, wg[5]; padding=1, stride=2) #(8,8,128,bs)
+    x5 = glayer3(x4, wg[6]; padding=1, stride=2) #(16,16,64,bs)
+    x6 = tanh.(deconv4(wg[end-1], x5; stride=2, padding=1) .+ wg[end]) #(32,32,3,bs)
+    return x6
 end
 
 
@@ -303,6 +315,11 @@ end
 function glayer2(x0, w, m; padding=1,stride=2, training=true)
     x = deconv4(w[1], x0; padding=padding, stride=stride)
     x = batchnorm(x, m, w[2]; training=training)
+    x = relu.(x)
+end
+
+function glayer3(x0, w, m; padding=1,stride=2)
+    x = deconv4(w, x0; padding=padding, stride=stride)
     x = relu.(x)
 end
 
@@ -324,14 +341,14 @@ function initwq(atype, cdim=10, gdim=2, winit=0.01)
     w = Any[]
     m = Any[]
 
-    push!(w, winit*randn(4,4,1,64))
+    push!(w, winit*randn(4,4,3,64))
     
     push!(w, winit*randn(4,4,64,128))
     push!(w, bnparams(128))
     push!(m, bnmoments())
-    
-    push!(w, winit*randn(1024,3200))
-    push!(w, bnparams(1024))
+
+    push!(w, winit*randn(4,4,128,256))
+    push!(w, bnparams(256))
     push!(m, bnmoments())
 
     #FC.128-batchnorm-LRELU
@@ -347,10 +364,11 @@ end
 
 function qnet(wq,mq,x; training=true, alpha=0.1)
     cdim=10; gdim=2;
-    x1 = dlayer1(x, wq[1])
-    x2 = dlayer2(x1, wq[2:3], mq[1]; training=training)
-    x2 = mat(x2) 
-    x3 = dlayer3(x2, wq[4:5], mq[2]; training=training)
+
+    x1 = dlayer1(x, w[1])
+    x2 = dlayer2(x1, w[2:3], m[1]; training=true)
+    x3 = dlayer2(x2, w[4:5], m[2]; training=true)
+    x3 = mat(x3) # (1024,Batchize)
     #FC.128-batchnorm-LRELU
     x4 = glayer1(x3, wq[6:7], mq[3]; training=training)
     #FC.output
@@ -435,6 +453,6 @@ function generate_and_plot(wg, mg; z=nothing, c=nothing, g=nothing, savefile=not
     plot_images(images, gridsize, scale, savefile)
 end
 
-splitdir(PROGRAM_FILE)[end] == "infogan_MNIST.jl" && main(ARGS)
+splitdir(PROGRAM_FILE)[end] == "infogan_SVHN2.jl" && main(ARGS)
 
 end # module
