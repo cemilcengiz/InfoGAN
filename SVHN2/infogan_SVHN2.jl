@@ -11,6 +11,7 @@ using MAT
 using Images
 using ArgParse
 using JLD2, FileIO
+using MLDatasets
 
 function main(args)
     o = parse_options(args)
@@ -19,8 +20,8 @@ function main(args)
     # load models, data, optimizers
     wd, wg, wq, md, mg, mq = load_weights(o[:atype], o[:zdim], o[:cdim], o[:ndisc], o[:gdim], o[:loadfile])
     wgq = Dict(:wg => wg, :wq => wq)
-    xtrn,ytrn = SVHN2.traindata() # 73,257 instances
-    dtrn = minibatch(xtrn, ytrn, o[:batchsize]; shuffle=true, xtype=o[:atype])  #length trnsize/batchsize
+    xtrn = load_traindata(o[:trndata_dir]) # 73,257 instances i.e. shape: (32,32,3,73257)
+    dtrn = minibatch(xtrn, o[:batchsize]; shuffle=true, xtype=o[:atype])  #length trnsize/batchsize
     optd = map(wi->eval(parse(o[:optim])), wd)
     optgq = Dict(
                  :wg => map(wi->Adam(;lr=0.003, beta1=0.5), wg),
@@ -31,13 +32,13 @@ function main(args)
     ##
     ny = 10 # length of categorical code
     # Discrete codes for example generations
-    l0 = map(i->reshape(collect(1:ny), 1, ny), 1:o[:gridrows])  #gridrows is 5 by default
+    l0 = map(i->reshape(collect(1:ny), 1, ny), 1:o[:gridrows]) 
     l1 = vec(vcat(l0...)) #[11...122...23...99...9910...10] vector with lenght ny*o[:gridsize]
     
     # Fix some noise and code to check the GAN output
     z_fix = sample_gauss(o[:atype],o[:zdim],ny*o[:gridrows])
 
-    #c = sample_categoric(o[:atype],o[:cdim],10*o[:gridrows])
+    # c = sample_categoric(o[:atype],o[:cdim],10*o[:gridrows])
     cl_rand = sample_categoric(o[:atype],o[:cdim],ny*o[:gridrows])
     cl = convert(o[:atype], disc_embed_mat[:,l1])
     c_fix = vcat(cl, cl_rand, cl_rand, cl_rand)  # control one disc r.v. the others are varying
@@ -60,10 +61,10 @@ function main(args)
     println("training started..."); flush(STDOUT)
     for epoch = 1:o[:epochs]
         dlossval = glossval = qlossval = 0
-        @time for (x,y) in dtrn
-            z = sample_gauss(o[:atype],o[:zdim],length(y))
-            c = sample_categoric_multiple(o[:atype],o[:cdim],length(y);n=4)
-            g = sample_unif(o[:atype],o[:gdim],length(y))
+        @time for x in dtrn
+            z = sample_gauss(o[:atype],o[:zdim],size(x,4))
+            c = sample_categoric_multiple(o[:atype],o[:cdim],size(x,4);n=4)
+            g = sample_unif(o[:atype],o[:gdim],size(x,4))
             #train D
             dlossval += train_discriminator!(wd,wgq,md,mg,2x-1,z,c,g,optd,o)
             #train G
@@ -101,13 +102,14 @@ function parse_options(args)
         ("--atype"; default=(gpu()>=0?"KnetArray{Float32}":"Array{Float32}");
          help="array and float type to use")
         ("--batchsize"; arg_type=Int; default=128; help="batch size")
+        ("--trndata_dir"; default="/KUFS/scratch/ccengiz17/InfoGAN/datasets/SVHN2/train_32x32.mat"; help=("path for training dataset"))
         ("--zdim"; arg_type=Int; default=124; help="noise dimension")
         ("--cdim"; arg_type=Int; default=10; help=("Discrete code length."))
         ("--ndisc"; arg_type=Int; default=4; help=("number of discrete(categorical) codes"))
         ("--gdim"; arg_type=Int; default=4; help=("Continuos code length."))
         ("--epochs"; arg_type=Int; default=100; help="# of training epochs")
         ("--seed"; arg_type=Int; default=1; help="random seed")
-        ("--gridrows"; arg_type=Int; default=5)
+        ("--gridrows"; arg_type=Int; default=10)
         ("--gridscale"; arg_type=Float64; default=2.0)
         ("--optim"; default="Adam(;lr=0.0002, beta1=0.5)")
         ("--loadfile"; default=nothing; help="file to load trained models")
@@ -123,6 +125,11 @@ function parse_options(args)
     return o
 end
 
+function load_traindata(path)
+    trn = matread(path)
+    return trn["X"]
+end
+    
 function load_weights(atype,zdim,cdim,ndisc,gdim,loadfile=nothing)
     if loadfile == nothing
         wd, md = initwd(atype)
@@ -205,7 +212,7 @@ function init_disc_embed(atype, code_len)
 end  
 
 
-function initwd(atype, winit=0.01)
+function initwd(atype, winit=0.02)
     w = Any[]
     m = Any[]
 
@@ -268,7 +275,7 @@ function train_discriminator!(wd,wgq,md,mg,real_images,z,c,g,optd,o)
     return lossval
 end
 
-function initwg(atype=Array{Float32}, zdim=124, cdim=10, ndisc=4, gdim=4, winit=0.01)
+function initwg(atype=Array{Float32}, zdim=124, cdim=10, ndisc=4, gdim=4, winit=0.02)
     #input: z+c*ndisc+g=124+10*4+4=168 dim
     w = Any[]
     m = Any[]
@@ -282,15 +289,15 @@ function initwg(atype=Array{Float32}, zdim=124, cdim=10, ndisc=4, gdim=4, winit=
     push!(w, bnparams(256))
     push!(m, bnmoments())
 
-    #upconv-relu
+    #upconv-relu-bn
     push!(w, winit*randn(4,4,128,256))
 
-    #upconv-relu
+    #upconv-relu-bn
     push!(w, winit*randn(4,4,64,128))
 
     #upconv-tanh
     push!(w, winit*randn(4,4,3,64))
-    push!(w, winit*randn(1,1,3,1))
+    push!(w, zeros(1,1,3,1))
     return convert_weights(w,atype), m
 end
 
@@ -299,13 +306,13 @@ function gnet(wg,mg,z,c,g; training=true)  #add c,g
     x1 = glayer1(x0, wg[1:2], mg[1]; training=training) #(1792,bs)
     x2 = reshape(x1, 2,2,448,size(x1,2)) #(2,2,448,bs)
     x3 = glayer2(x2, wg[3:4], mg[2]; padding=1, training=training) #(4,4,256,bs)
-    x4 = glayer3(x3, wg[5]; padding=1, stride=2) #(8,8,128,bs)
-    x5 = glayer3(x4, wg[6]; padding=1, stride=2) #(16,16,64,bs)
+    x4 = glayer3(x3, wg[5]; padding=1) #(8,8,128,bs)
+    x5 = glayer3(x4, wg[6]; padding=1) #(16,16,64,bs)
     x6 = tanh.(deconv4(wg[end-1], x5; stride=2, padding=1) .+ wg[end]) #(32,32,3,bs)
     return x6
 end
 
-
+ 
 function glayer1(x0, w, m; training=true)
     x = w[1] * x0
     x = batchnorm(x, m, w[2]; training=training)
@@ -318,7 +325,7 @@ function glayer2(x0, w, m; padding=1,stride=2, training=true)
     x = relu.(x)
 end
 
-function glayer3(x0, w, m; padding=1,stride=2)
+function glayer3(x0, w; padding=1,stride=2)
     x = deconv4(w, x0; padding=padding, stride=stride)
     x = relu.(x)
 end
@@ -337,7 +344,7 @@ function train_generator!(wgq,wd,mg,md,z,c,g,optgq,o)
     return lossval
 end
 
-function initwq(atype, cdim=10, gdim=2, winit=0.01)
+function initwq(atype, cdim=10, ndisc=4, gdim=4, winit=0.02)
     w = Any[]
     m = Any[]
 
@@ -357,53 +364,56 @@ function initwq(atype, cdim=10, gdim=2, winit=0.01)
     push!(m, bnmoments())
 
     #FC output
-    push!(w, winit*randn(cdim+gdim,128))
-    push!(w, zeros(cdim+gdim,1))
+    push!(w, winit*randn(ndisc*cdim + gdim, 128))
+    push!(w, zeros(ndisc*cdim + gdim, 1))
     return convert_weights(w,atype), m
 end
 
-function qnet(wq,mq,x; training=true, alpha=0.1)
-    cdim=10; gdim=2;
+function qnet(w,m,x; training=true, alpha=0.1)
+    cdim=10; ndisc=4; gdim=4;
 
     x1 = dlayer1(x, w[1])
     x2 = dlayer2(x1, w[2:3], m[1]; training=true)
     x3 = dlayer2(x2, w[4:5], m[2]; training=true)
     x3 = mat(x3) # (1024,Batchize)
     #FC.128-batchnorm-LRELU
-    x4 = glayer1(x3, wq[6:7], mq[3]; training=training)
+    x4 = glayer1(x3, w[6:7], m[3]; training=training) # (128,bs)
     #FC.output
-    x5 = wq[end-1]*x4 .+ wq[end] #shape: (cdim+gdim,batchsize)
-
+    x5 = w[end-1]*x4 .+ w[end] #shape: (cdim*ndisc+gdim,bs)
+    
     # Apply softmax for discrete code
-    xc = x5[1:cdim,:];  xg = x5[1+cdim:end,:];
+    xc = x5[1:ndisc*cdim,:];  
     xc = exp.(logp(xc,1))  #shape: (cdim,batchsize)
+    #continuous
+    xg = x5[1+ndisc*cdim:end,:];  #(2,bs)
 
-    # Apply sigmoid individually for continuous codes
-    # xg = sigm.(xg) #shape: (2,batchsize)
     return (xc,xg)
 end
 
 function qloss(wgq, mg, mq, z, c, g; atype=KnetArray{Float32}, fix_std=true)
     fake_images = gnet(wgq[:wg],mg,z,c,g; training=true)
-    q_c_given_x_disc, q_c_given_x_cont = qnet(wgq[:wq],mq,fake_images)  #shape (cdim,batchsize and gdim,batchsize)
-    
-    disc_cross_ent = -mean(sum(log.(q_c_given_x_disc +1e-8) .* c, 1))
-    disc_ent = -mean(sum(log.(c+1e-8) .* c, 1))
-    disc_loss = -disc_ent + disc_cross_ent  # negative of mutual info.
-  #  println("disc loss= ", getval(disc_loss))
+    q_c_given_x_disc, q_c_given_x_cont = qnet(wgq[:wq],mq,fake_images)
 
-# For continuous code (generally mean and standard dev. of a Gaussian r.v.)
-    mu = q_c_given_x_cont[1,:]   # first row is for mean
-    if fix_std   # we use fixed standard deviation i.e. 1.
-        sg = convert(atype, ones(size(mu)))  # shape: (1,batchsize)
-    else  #predict standard dev using qnet
-        sg = exp.(q_c_given_x_cont[2,:])  # second rov is for variance
+    #discrete code
+    cdim=10;     ndisc = 4;  
+    disc_loss = 0;
+    for i=1:ndisc
+        cc = c[(i-1)*cdim+1 : i*cdim, :]
+        disc_cross_ent = -mean(sum(log.(q_c_given_x_disc[(i-1)*cdim+1 : i*cdim, :] +1e-8) .* cc, 1))
+        disc_ent = -mean(sum(log.(cc+1e-8) .* cc, 1))
+        disc_loss += -disc_ent + disc_cross_ent  # negative of mutual info
     end
-    nsamples = 2
-    nll_gauss = 0.5*mean(abs2.(mu .- g[1,:]) ./ sg) + 0.5*mean(abs2.(mu .- g[2,:]) ./ sg) + 0.5*nsamples*mean(log.(sg + 1e-8))   
-  #  println("nll_gauss= ", getval(nll_gauss))
-
+    
+    #continuous code
+    ncont = 4;
+    nll_gauss = 0
+    for i=1:ncont
+        mu = q_c_given_x_cont[i,:]   # first row is for mean
+        nll_gauss += 0.5*mean(abs2.(mu .- g[i,:]))
+    end
+   
     return disc_loss + nll_gauss
+
 end
 
 qlossgradient = gradloss(qloss)
@@ -419,17 +429,17 @@ function generate_images(wg, mg, z=nothing, c=nothing, g=nothing)
     nimg = size(wg[1],2)
     atype = wg[1] isa KnetArray ? KnetArray{Float32} : Array{Float32}
     if z == nothing 
-        zdim = 62
+        zdim = 124
         z = sample_gauss(atype,zdim,nimg)
     end
     
     if c == nothing
-        cdim = 10
-        c = sample_categoric(atype,cdim,nimg)
+        cdim = 10; ndisc=4;
+        c = sample_categoric_multiple(atype,cdim,nimg;n=4)
     end
     
     if g == nothing
-        gdim = 2
+        gdim = 4
         g = sample_unif(atype,gdim,nimg)
     end
     output = Array(0.5*(1+gnet(wg,mg,z,c,g; training=false)))
@@ -439,11 +449,11 @@ end
 function plot_images(images, gridsize=(8,8), scale=1.0, savefile=nothing)
     grid = Main.make_image_grid(images; gridsize=gridsize, scale=scale)
     if savefile == nothing
-        #display(colorview(RGB, grid))
-        display(colorview(Gray, grid))
+        display(colorview(RGB, grid))
+        #display(colorview(Gray, grid))
     else
-        # save(savefile, colorview(RGB, grid))
-        save(savefile, colorview(Gray, grid))
+        save(savefile, colorview(RGB, grid))
+        #save(savefile, colorview(Gray, grid))
     end
 end
 
