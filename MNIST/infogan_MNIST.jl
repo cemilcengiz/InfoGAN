@@ -14,7 +14,7 @@ using JLD2, FileIO
 function main(args)
     o = parse_options(args)
     o[:seed] > 0 && Knet.setseed(o[:seed])
-
+    
     # load models, data, optimizers
     wd, wg, wq, md, mg, mq = load_weights(o[:atype], o[:zdim], o[:cdim], o[:gdim], o[:loadfile])
     wgq = Dict(:wg => wg, :wq => wq)
@@ -34,16 +34,15 @@ function main(args)
     l1 = vec(vcat(l0...)) #[11...122...23...99...9910...10]' column vector with lenght ny*o[:gridsize]
     
     # Fix some noise and code to check the GAN output
-    z_fix = sample_gauss(o[:atype],o[:zdim],10*o[:gridrows])
+    z_fix = sample_gauss(o[:atype],o[:zdim],ny*o[:gridrows])
     c_fix = convert(o[:atype], disc_embed_mat[:,l1])
     #c = sample_categoric(o[:atype],o[:cdim],10*o[:gridrows])
     gl0 = map(i->Array{Float32}(reshape(-2:4/(ny-1):2, 1, ny)), 1:o[:gridrows])
-    gl = vec(hcat(gl0...))
     gl = hcat(gl0...)
     gl = convert(o[:atype],gl)
     gl_rand = sample_unif(o[:atype],1,10*o[:gridrows])
    # g_fix = vcat(gl, gl_rand)  # fix one cont r.v. constant. the other is random
-    g_fix = vcat(gl, gl)
+    g_fix = vcat(gl, gl_rand)
     
     if o[:outdir] != nothing && !isdir(o[:outdir])
         mkpath(o[:outdir])
@@ -69,7 +68,7 @@ function main(args)
         dlossval /= length(dtrn); glossval /= length(dtrn); qlossval /= length(dtrn);
         println((:epoch,epoch,:dloss,dlossval,:gloss,glossval,:qloss,qlossval))
         flush(STDOUT)
-
+        
         # save models and generations
         if o[:outdir] != nothing #&& epoch % 5==0
             filename = @sprintf("%04d.png",epoch)
@@ -101,7 +100,7 @@ function parse_options(args)
         ("--gdim"; arg_type=Int; default=2; help=("Continuos code length."))
         ("--epochs"; arg_type=Int; default=100; help="# of training epochs")
         ("--seed"; arg_type=Int; default=1; help="random seed")
-        ("--gridrows"; arg_type=Int; default=5)
+        ("--gridrows"; arg_type=Int; default=10)
         ("--gridscale"; arg_type=Float64; default=2.0)
         ("--optim"; default="Adam(;lr=0.0002, beta1=0.5)")
         ("--loadfile"; default=nothing; help="file to load trained models")
@@ -170,19 +169,15 @@ function leaky_relu(x, alpha=0.1)
     return pos + neg
 end
 
-function sample_gauss(atype,zdim,nsamples;mu=0,sigma=1)
-    dist = Normal(mu,sigma)
-    z = rand(dist, zdim, nsamples)
-    convert(atype,z)
-end
-
 function sample_unif(atype,gdim,nsamples;l=-1,u=1)
     dist = Uniform(l,u)
     g = rand(dist, gdim, nsamples)
     convert(atype, g)
 end
 
-function sample_categoric(atype,cdim,nsamples,mu=0.5,sigma=0.5)
+sample_gauss = sample_unif
+
+function sample_categoric(atype,cdim,nsamples)
     dist = Multinomial(1,cdim)   
     c = rand(dist,nsamples)   #one-hot vectors.shape [cdim,nsamples]
     convert(atype, c)
@@ -194,7 +189,7 @@ function init_disc_embed(atype, code_len)
 end  
 
 
-function initwd(atype, winit=0.01)
+function initwd(atype, winit=0.02)
     w = Any[]
     m = Any[]
 
@@ -219,7 +214,7 @@ function dnet(w,x,m; training=true, alpha=0.1)
     x2 = mat(x2)
     x3 = dlayer3(x2, w[4:5], m[2]; training=true)
     x4 = w[end-1]*x3 .+ w[end]
-    x5 = sigm.(x4) #??? 
+    x5 = sigm.(x4)
 end
 
 function dlayer1(x0, w; stride=2, padding=0, alpha=0.1)
@@ -257,7 +252,7 @@ function train_discriminator!(wd,wgq,md,mg,real_images,z,c,g,optd,o)
     return lossval
 end
 
-function initwg(atype=Array{Float32}, zdim=62, cdim=10, gdim=2, winit=0.01)
+function initwg(atype=Array{Float32}, zdim=62, cdim=10, gdim=2, winit=0.02)
     #input: z+c+g=62+10+2=74 dim
     w = Any[]
     m = Any[]
@@ -278,7 +273,7 @@ function initwg(atype=Array{Float32}, zdim=62, cdim=10, gdim=2, winit=0.01)
 
     # final deconvolution layer
     push!(w, winit*randn(4,4,1,64))
-    push!(w, winit*randn(1,1,1,1))
+    push!(w, zeros(1,1,1,1))
     return convert_weights(w,atype), m
 end
 
@@ -320,7 +315,7 @@ function train_generator!(wgq,wd,mg,md,z,c,g,optgq,o)
     return lossval
 end
 
-function initwq(atype, cdim=10, gdim=2, winit=0.01)
+function initwq(atype, cdim=10, gdim=2, winit=0.02)
     w = Any[]
     m = Any[]
 
@@ -340,8 +335,8 @@ function initwq(atype, cdim=10, gdim=2, winit=0.01)
     push!(m, bnmoments())
 
     #FC output
-    push!(w, winit*randn(cdim+gdim,128))
-    push!(w, zeros(cdim+gdim,1))
+    push!(w, winit*randn(cdim+gdim, 128))
+    push!(w, zeros(cdim+gdim, 1))
     return convert_weights(w,atype), m
 end
 
@@ -357,34 +352,28 @@ function qnet(wq,mq,x; training=true, alpha=0.1)
     x5 = wq[end-1]*x4 .+ wq[end] #shape: (cdim+gdim,batchsize)
 
     # Apply softmax for discrete code
-    xc = x5[1:cdim,:];  xg = x5[1+cdim:end,:];
-    xc = exp.(logp(xc,1))  #shape: (cdim,batchsize)
+    xc = x5[1:cdim,:];  
 
-    # Apply sigmoid individually for continuous codes
-    # xg = sigm.(xg) #shape: (2,batchsize)
+    # continuous
+    xg = x5[1+cdim:end,:]; # (1,batchsize)
     return (xc,xg)
 end
 
 function qloss(wgq, mg, mq, z, c, g; atype=KnetArray{Float32}, fix_std=true)
     fake_images = gnet(wgq[:wg],mg,z,c,g; training=true)
-    q_c_given_x_disc, q_c_given_x_cont = qnet(wgq[:wq],mq,fake_images)  #shape (cdim,batchsize and gdim,batchsize)
-    
-    disc_cross_ent = -mean(sum(log.(q_c_given_x_disc +1e-8) .* c, 1))
-    disc_ent = -mean(sum(log.(c+1e-8) .* c, 1))
-    disc_loss = -disc_ent + disc_cross_ent  # negative of mutual info.
-  #  println("disc loss= ", getval(disc_loss))
+    q_c_given_x_disc, q_c_given_x_cont = qnet(wgq[:wq],mq,fake_images) #shape (cdim,batchsize and gdim,batchsize)
 
-# For continuous code (generally mean and standard dev. of a Gaussian r.v.)
-    mu = q_c_given_x_cont[1,:]   # first row is for mean
-    if fix_std   # we use fixed standard deviation i.e. 1.
-        sg = convert(atype, ones(size(mu)))  # shape: (1,batchsize)
-    else  #predict standard dev using qnet
-        sg = exp.(q_c_given_x_cont[2,:])  # second rov is for variance
+    logprob = logp(q_c_given_x_disc, 1)
+    disc_loss = -mean(sum(logprob .* c, 1))
+
+    #continuous code
+    ncont = 2;
+    nll_gauss = 0
+    for i=1:ncont
+        mu = q_c_given_x_cont[i,:]   # first row is for mean
+        nll_gauss += 0.5*mean(abs2.(mu .- g[i,:]))
     end
-    nsamples = 2
-    nll_gauss = 0.5*mean(abs2.(mu .- g[1,:]) ./ sg) + 0.5*mean(abs2.(mu .- g[2,:]) ./ sg) + 0.5*nsamples*mean(log.(sg + 1e-8))   
-  #  println("nll_gauss= ", getval(nll_gauss))
-
+    
     return disc_loss + nll_gauss
 end
 
